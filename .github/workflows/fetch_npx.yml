@@ -1,0 +1,53 @@
+name: fetch-npx-slice
+on:
+  workflow_dispatch: {}
+permissions:
+  contents: write
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install mtscomp requests numpy
+      - name: fetch a 4 s slice of the UCL Hopkins_20160722 Neuropixels recording and its Kilosort output
+        run: |
+          python - <<'EOF'
+          import requests, json, os, glob, zipfile, numpy as np, mtscomp
+          B = "https://ndownloader.figshare.com/files/"
+          def get(fid, name): open(name, "wb").write(requests.get(B + fid, allow_redirects=True).content)
+          os.makedirs("ucl", exist_ok=True); os.chdir("ucl")
+          get("44738764", "raw.ch"); get("44571769", "raw.meta"); get("44571760", "cluster_groups.csv")
+          get("44571757", "channel_positions.npy"); get("44571754", "channel_map.npy"); get("44571844", "dataset.zip")
+          ch = json.load(open("raw.ch")); off = ch["chunk_offsets"]; bounds = ch["chunk_bounds"]
+          T0, DUR = 10, 4
+          i0 = next(i for i, b in enumerate(bounds) if b > T0 * 30000) - 1; i1 = i0 + DUR
+          f = open("raw.cbin", "wb"); f.truncate(off[-1]); f.seek(off[i0])
+          r = requests.get(B + "44739280", headers={"Range": "bytes=%d-%d" % (off[i0], off[i1] - 1)}, allow_redirects=True, stream=True)
+          for c in r.iter_content(1 << 20): f.write(c)
+          f.close()
+          rd = mtscomp.Reader(); rd.open("raw.cbin", "raw.ch")
+          s0, s1 = int(bounds[i0]), int(bounds[i1]); sl = np.asarray(rd[s0:s1], dtype=np.int16)
+          sl.tofile("slice.bin"); os.remove("raw.cbin")
+          json.dump({"start_sample": s0, "n_samples": int(sl.shape[0]), "n_channels": int(sl.shape[1]), "t0_s": T0, "dur_s": DUR}, open("slice.json", "w"))
+          zipfile.ZipFile("dataset.zip").extractall("ks_full"); os.remove("dataset.zip")
+          src = os.path.dirname(glob.glob("ks_full/**/spike_times.npy", recursive=True)[0]); os.makedirs("ks", exist_ok=True)
+          st = np.load(os.path.join(src, "spike_times.npy")).ravel(); m = (st >= s0 - 100) & (st < s1 + 100)
+          for n in ("spike_times", "spike_clusters", "spike_templates", "amplitudes"):
+              p = os.path.join(src, n + ".npy")
+              if os.path.exists(p): np.save(os.path.join("ks", n + ".npy"), np.load(p).ravel()[m])
+          for n in ("templates.npy", "channel_positions.npy", "channel_map.npy", "params.py", "cluster_groups.csv", "cluster_group.tsv", "templates_ind.npy", "whitening_mat.npy", "whitening_mat_inv.npy"):
+              p = os.path.join(src, n)
+              if os.path.exists(p) and os.path.getsize(p) < 90e6: os.replace(p, os.path.join("ks", n))
+          import shutil; shutil.rmtree("ks_full")
+          print(sl.shape, s0, m.sum(), "spikes in window", sorted(os.listdir("ks")))
+          EOF
+          ls -la ucl ucl/ks
+      - run: |
+          git config user.name npx-bot
+          git config user.email npx-bot@users.noreply.github.com
+          git add ucl
+          git commit -m "UCL Hopkins_20160722 4 s slice (t=10-14 s) + Kilosort output"
+          git push
