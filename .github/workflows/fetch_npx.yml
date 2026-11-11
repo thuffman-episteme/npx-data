@@ -11,7 +11,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - run: pip install mtscomp requests numpy
+      - run: pip install mtscomp requests numpy tqdm
       - name: fetch a 4 s slice of the UCL Hopkins_20160722 Neuropixels recording and its Kilosort output
         run: |
           python - <<'EOF'
