@@ -25,7 +25,7 @@ jobs:
           T0, DUR = 10, 4
           i0 = next(i for i, b in enumerate(bounds) if b > T0 * 30000) - 1; i1 = i0 + DUR
           f = open("raw.cbin", "wb"); f.truncate(off[-1]); f.seek(off[i0])
-          r = requests.get(B + "44739280", headers={"Range": "bytes=%d-%d" % (off[i0], off[i1] - 1)}, allow_redirects=True, stream=True)
+          r = requests.get(B + "44739280", headers={"Range": "bytes=%d-%d" % (off[i0], off[i1 + 1] - 1)}, allow_redirects=True, stream=True)
           for c in r.iter_content(1 << 20): f.write(c)
           f.close()
           rd = mtscomp.Reader(); rd.open("raw.cbin", "raw.ch")
