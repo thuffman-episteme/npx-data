@@ -1,0 +1,230 @@
+name: fetch-imposed-motion-slice
+# Slice of the imposed-motion Neuropixels recordings (Steinmetz et al., Science 2021; figshare doi:10.6084/m9.figshare.14024495,
+# CC BY 4.0), read out of the remote zip by HTTP range requests and published as assets of a GitHub Release.
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: zip URL (dataset1 26476589, dataset2 26477201, dataset3 26496131)
+        default: "https://ndownloader.figshare.com/files/26476589"
+      probes:
+        default: "p1,p2"
+      t0:
+        description: start in seconds, or auto (20 s before the manipulator starts)
+        default: "auto"
+      dur:
+        default: "120"
+      tag:
+        default: "imposed-motion-d1"
+  push:
+    paths:
+      - .github/workflows/fetch_imposed_motion.yml
+permissions:
+  contents: write
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      IM_URL: ${{ github.event.inputs.url || 'https://ndownloader.figshare.com/files/26476589' }}
+      IM_PROBES: ${{ github.event.inputs.probes || 'p1,p2' }}
+      IM_T0: ${{ github.event.inputs.t0 || 'auto' }}
+      IM_DUR: ${{ github.event.inputs.dur || '120' }}
+      TAG: ${{ github.event.inputs.tag || 'imposed-motion-d1' }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install requests numpy inflate64 zipfile-deflate64
+      - name: fetch the slices and the small files
+        run: |
+          python - <<'EOF'
+          import os, io, re, sys, json, time, struct, zlib, zipfile, tarfile, subprocess, traceback
+          import requests, numpy as np
+          try:
+              import zipfile_deflate64  # noqa: F401   lets zipfile read Deflate64 members (method 9)
+              import inflate64
+          except Exception:                 # pragma: no cover
+              inflate64 = None
+
+          URL = os.environ.get("IM_URL", "https://ndownloader.figshare.com/files/26476589")      # dataset1.zip
+          PROBES = [p for p in os.environ.get("IM_PROBES", "p1,p2").split(",") if p]
+          T0_ARG = os.environ.get("IM_T0", "auto"); DUR = float(os.environ.get("IM_DUR", "120")); PRE = 20.0
+          SMALL_MAX = 150 << 20; SMALL_TOTAL = 1400 << 20; PART = "1500M"
+          OUT = "out"; os.makedirs(OUT + "/small", exist_ok=True)
+          report = {"url": URL, "log": [], "probes": {}}
+          def log(*a):
+              s = " ".join(str(x) for x in a); print(s, flush=True); report["log"].append(s)
+          def save_report():
+              json.dump(report, open(OUT + "/report.json", "w"), indent=1)
+
+          S = requests.Session()
+          def ranged(a, b, stream=False):
+              """bytes [a, b) of the remote file"""
+              last = None
+              for attempt in range(6):
+                  try:
+                      r = S.get(URL, headers={"Range": "bytes=%d-%d" % (a, b - 1)}, allow_redirects=True, stream=stream, timeout=180)
+                      if r.status_code == 206 or (r.status_code == 200 and a == 0): return r
+                      last = "http %d" % r.status_code; r.close()
+                  except Exception as e:
+                      last = repr(e)[:200]
+                  log("range request", a, b, "failed:", last, "- retry", attempt); time.sleep(5 * (attempt + 1))
+              raise RuntimeError("range request failed: %s" % last)
+
+          r0 = ranged(0, 1); TOTAL = int(r0.headers["Content-Range"].split("/")[1]); r0.close()
+          log("remote size", TOTAL)
+
+          class HttpFile(io.RawIOBase):
+              BLK = 8 << 20
+              def __init__(self): self.pos = 0; self.cache = {}; self.nreq = 0
+              def seekable(self): return True
+              def readable(self): return True
+              def tell(self): return self.pos
+              def seek(self, off, whence=0):
+                  self.pos = off if whence == 0 else (self.pos + off if whence == 1 else TOTAL + off); return self.pos
+              def _blk(self, i):
+                  if i not in self.cache:
+                      if len(self.cache) >= 12: self.cache.pop(next(iter(self.cache)))
+                      a = i * self.BLK; self.cache[i] = ranged(a, min(a + self.BLK, TOTAL)).content; self.nreq += 1
+                  return self.cache[i]
+              def read(self, n=-1):
+                  if n is None or n < 0: n = TOTAL - self.pos
+                  out = bytearray()
+                  while n > 0 and self.pos < TOTAL:
+                      i, o = divmod(self.pos, self.BLK); b = self._blk(i)[o:o + n]
+                      out += b; self.pos += len(b); n -= len(b)
+                  return bytes(out)
+              def readinto(self, buf):
+                  d = self.read(len(buf)); buf[:len(d)] = d; return len(d)
+
+          hf = HttpFile(); zf = zipfile.ZipFile(hf)
+          infos = [i for i in zf.infolist() if not i.is_dir()]
+          listing = [dict(name=i.filename, size=i.file_size, csize=i.compress_size, method=i.compress_type, offset=i.header_offset) for i in infos]
+          json.dump(listing, open(OUT + "/listing.json", "w"), indent=1)
+          log("members", len(infos), "range requests for the directory", hf.nreq)
+          for e in sorted(listing, key=lambda e: -e["size"])[:12]: log("  ", e["name"], e["size"], "method", e["method"])
+
+          RAW_EXT = (".bin", ".dat", ".cbin")
+          def probe_of(name):
+              for p in PROBES:
+                  if re.search(r"(^|[/_.\-])%s([/_.\-]|$)" % re.escape(p), name.lower()): return p
+              return None
+
+          small = sorted([i for i in infos if not i.filename.lower().endswith(RAW_EXT) and i.file_size <= SMALL_MAX], key=lambda i: i.file_size)
+          tot = 0; kept = []; skipped = []
+          for i in small:
+              if tot + i.file_size > SMALL_TOTAL: skipped.append(i.filename); continue
+              try:
+                  data = zf.read(i); p = os.path.join(OUT, "small", i.filename); os.makedirs(os.path.dirname(p), exist_ok=True)
+                  open(p, "wb").write(data); tot += i.file_size; kept.append(i.filename)
+              except Exception as e:
+                  log("small file failed", i.filename, repr(e)[:200]); skipped.append(i.filename)
+          report["small_kept"] = kept; report["small_skipped"] = skipped + [i.filename for i in infos if i.file_size > SMALL_MAX and not i.filename.lower().endswith(RAW_EXT)]
+          log("small files kept", len(kept), "bytes", tot, "skipped", len(report["small_skipped"]))
+          save_report()
+
+          def meta_for(binname):
+              for cand in (re.sub(r"\.bin$", ".meta", binname), binname + ".meta"):
+                  p = os.path.join(OUT, "small", cand)
+                  if os.path.exists(p):
+                      m = {}
+                      for line in open(p, errors="replace"):
+                          if "=" in line:
+                              k, v = line.strip().split("=", 1); m[k.lstrip("~")] = v
+                      return m
+              return {}
+
+          def manip_start(probe):
+              """first manipulator timestamp after 0 (s), from the manip timestamp file for this probe if there is one"""
+              cands = [k for k in kept if "manip" in k.lower() and "timestamp" in k.lower() and k.lower().endswith(".npy")]
+              cands.sort(key=lambda k: (probe_of(k) != probe, k))
+              for k in cands:
+                  try:
+                      ts = np.load(os.path.join(OUT, "small", k)).squeeze().astype(float)
+                      nz = ts[ts > 1.0]
+                      if len(nz): return float(nz.min()), k, [float(x) for x in ts.ravel()[:40]]
+                  except Exception as e:
+                      log("manip file unreadable", k, repr(e)[:120])
+              return None, None, None
+
+          raws = [i for i in infos if i.filename.lower().endswith(".bin") and ".lf." not in i.filename.lower()]
+          raws.sort(key=lambda i: -i.file_size)
+          assign = {}
+          for i in raws:
+              p = probe_of(i.filename)
+              if p and p not in assign: assign[p] = i
+          left = [i for i in raws if i not in assign.values()]
+          for p in PROBES:
+              if p not in assign and left: assign[p] = left.pop(0); log("probe", p, "assigned by size to", assign[p].filename)
+
+          def stream_slice(info, b0, b1, dst):
+              """write uncompressed bytes [b0, b1) of a zip member to dst"""
+              hdr = ranged(info.header_offset, info.header_offset + 30).content
+              assert hdr[:4] == b"PK\x03\x04", "bad local header"
+              nlen, elen = struct.unpack("<HH", hdr[26:30]); data_off = info.header_offset + 30 + nlen + elen
+              t0 = time.time(); written = 0
+              with open(dst, "wb") as f:
+                  if info.compress_type == 0:
+                      r = ranged(data_off + b0, data_off + b1, stream=True)
+                      for c in r.iter_content(4 << 20): f.write(c); written += len(c)
+                      r.close(); return written, time.time() - t0, b1 - b0
+                  if info.compress_type == 8: dec = zlib.decompressobj(-15); inflate = dec.decompress
+                  elif info.compress_type == 9:
+                      assert inflate64 is not None, "Deflate64 member but inflate64 is not installed"
+                      dec = inflate64.Inflater(); inflate = dec.inflate
+                  else: raise RuntimeError("unsupported compression method %d" % info.compress_type)
+                  r = ranged(data_off, data_off + info.compress_size, stream=True); pos = 0; cin = 0; nxt = 1 << 30
+                  for c in r.iter_content(1 << 20):
+                      cin += len(c); out = inflate(c); n = len(out)
+                      if pos + n > b0:
+                          a = max(b0 - pos, 0); b = min(b1 - pos, n)
+                          if b > a: f.write(out[a:b]); written += b - a
+                      pos += n
+                      if pos >= nxt: log("   inflated %.1f GB (%.1f GB compressed) in %.0f s" % (pos / 2**30, cin / 2**30, time.time() - t0)); nxt += 1 << 30
+                      if pos >= b1: break
+                  r.close()
+              return written, time.time() - t0, cin
+
+          for p in PROBES:
+              rep = report["probes"].setdefault(p, {})
+              try:
+                  info = assign[p]; meta = meta_for(info.filename)
+                  nch = int(meta.get("nSavedChans", 385)); fs = float(meta.get("imSampRate", 30000)); nfr = info.file_size // (2 * nch)
+                  ms, mfile, mts = manip_start(p)
+                  t0 = float(T0_ARG) if T0_ARG != "auto" else (max(ms - PRE, 0.0) if ms is not None else 560.0)
+                  s0 = int(round(t0 * fs)); s1 = min(s0 + int(round(DUR * fs)), nfr)
+                  rep.update(member=info.filename, method=info.compress_type, size=info.file_size, csize=info.compress_size, n_channels=nch, fs=fs, n_frames_total=int(nfr),
+                             duration_total_s=nfr / fs, manip_file=mfile, manip_timestamps=mts, manip_start_s=ms, t0_s=t0, start_sample=s0, n_samples=int(s1 - s0),
+                             probe_type=meta.get("imDatPrb_type"), meta_keys=sorted(meta)[:80])
+                  log("probe", p, info.filename, "channels", nch, "fs", fs, "total %.1f s" % (nfr / fs), "manip start", ms, "slice", t0, "to", t0 + (s1 - s0) / fs)
+                  dst = os.path.join(OUT, p + "_slice.bin")
+                  w, dt, cin = stream_slice(info, s0 * 2 * nch, s1 * 2 * nch, dst)
+                  assert w == (s1 - s0) * 2 * nch, "short slice: %d of %d bytes" % (w, (s1 - s0) * 2 * nch)
+                  x = np.memmap(dst, dtype=np.int16, mode="r").reshape(-1, nch)
+                  rep.update(bytes=int(w), seconds=round(dt, 1), compressed_bytes_read=int(cin), first_frame=[int(v) for v in x[0, :8]],
+                             rms_first_second=[float(np.std(x[:int(fs), c].astype(np.float64))) for c in (0, nch // 4, nch // 2, 3 * nch // 4)],
+                             minmax=[int(x[:int(fs)].min()), int(x[:int(fs)].max())])
+                  del x
+                  json.dump(rep, open(os.path.join(OUT, p + "_slice.json"), "w"), indent=1)
+                  subprocess.run("gzip -1 -c %s | split -b %s -d - %s.gz.part && rm %s" % (dst, PART, dst, dst), shell=True, check=True)
+                  rep["parts"] = sorted(f for f in os.listdir(OUT) if f.startswith(p + "_slice.bin.gz.part"))
+                  log("probe", p, "slice done:", w, "bytes in %.0f s," % dt, len(rep["parts"]), "parts")
+              except Exception as e:
+                  rep["error"] = traceback.format_exc()[-1500:]; log("probe", p, "FAILED", repr(e)[:300])
+              save_report()
+
+          with tarfile.open(OUT + "/small.tgz", "w:gz", compresslevel=1) as t: t.add(OUT + "/small", arcname="small")
+          subprocess.run("rm -rf %s/small" % OUT, shell=True)
+          report["small_tgz_bytes"] = os.path.getsize(OUT + "/small.tgz"); save_report()
+          log("done"); save_report()
+          EOF
+          ls -la out
+      - name: publish as a release
+        if: always()
+        run: |
+          ls -la out || exit 0
+          find out -mindepth 1 -type d -exec rm -rf {} + ; find out -type f -size +1900M -delete
+          gh release delete "$TAG" -y --cleanup-tag --repo "$GITHUB_REPOSITORY" 2>/dev/null || true
+          gh release create "$TAG" out/* --repo "$GITHUB_REPOSITORY" --title "Imposed-motion Neuropixels recordings, slice ($TAG)" --notes "Slices of the imposed-motion recordings of Steinmetz et al., Science 2021 (doi:10.1126/science.abf4588); data from figshare doi:10.6084/m9.figshare.14024495, licence CC BY 4.0. Concatenate <probe>_slice.bin.gz.partNN and gunzip to int16 [n_samples x n_channels]; <probe>_slice.json has the start sample and rate; small.tgz has the metadata, manipulator log and spike-sorting files; listing.json lists the zip; report.json says what this run did."
